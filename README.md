@@ -1,5 +1,7 @@
 # FilzaEscapedDS
-Filza Escaped Darksword, support iOS 17.0-26.0.1. This repo open source the tweak inject into the Filza iPA (4.0.0 and back, 4.0.2 seems crash something)
+Filza Escaped Darksword, support iOS 17.0-26.0.1 (except 18.7.2-18.7.7). This repo open source the tweak inject into the Filza iPA (4.0.0 and back, 4.0.2 seems crash something)
+
+About iPhone 17 series: IT WON'T WORK because of MTE. Starting from iPhone 17, Apple added MTE to block anyone trying to access krw, so it will not work (at least atm, hoping someone actually do a bypass for MTE 😉)
 
 # Credit
 - Thanks to [Duy Tran](https://github.com/khanhduytran0) for the sandbox hook token
